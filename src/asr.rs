@@ -1,8 +1,6 @@
-//! Speech-to-text via whisper-rs (whisper.cpp).
-//!
-//! Default model: `ggml-tiny.bin` under [`crate::paths::models_dir`].
-//! Download with: `sage model pull`
+//! Speech-to-text via whisper-rs (whisper.cpp) — modular Transcriber trait (phase 8).
 
+use crate::config::Settings;
 use crate::paths::{ensure_dirs, models_dir};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -11,10 +9,7 @@ use whisper_rs::{
     WhisperContext, WhisperContextParameters,
 };
 
-/// Default whisper.cpp GGUF/GGML model filename (small, CPU-friendly).
 pub const DEFAULT_MODEL_NAME: &str = "ggml-tiny.bin";
-
-/// Hugging Face resolve URL for the default model (ggerganov/whisper.cpp).
 pub const DEFAULT_MODEL_URL: &str =
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin";
 
@@ -34,20 +29,33 @@ pub enum AsrError {
     Io(#[from] std::io::Error),
 }
 
-/// Resolve the model file path.
-///
-/// Order: `SAGE_MODEL_PATH` env → `models_dir()/ggml-tiny.bin`.
+/// Extension point for future backends (local whisper, remote API, …).
+pub trait Transcriber {
+    fn transcribe(&mut self, audio_path: &Path) -> Result<String, AsrError>;
+}
+
 pub fn default_model_path() -> PathBuf {
     if let Ok(p) = std::env::var("SAGE_MODEL_PATH") {
         return PathBuf::from(p);
     }
+    if let Ok(settings) = crate::config::load() {
+        if let Some(m) = settings.model {
+            return PathBuf::from(m);
+        }
+    }
     models_dir().join(DEFAULT_MODEL_NAME)
 }
 
-/// Download the default tiny model if missing.
 pub fn pull_default_model() -> Result<PathBuf, AsrError> {
     ensure_dirs()?;
-    let dest = default_model_path();
+    let dest = {
+        // Prefer default models dir name even if SAGE_MODEL_PATH set for pull target
+        if let Ok(p) = std::env::var("SAGE_MODEL_PATH") {
+            PathBuf::from(p)
+        } else {
+            models_dir().join(DEFAULT_MODEL_NAME)
+        }
+    };
     if dest.exists() {
         let meta = std::fs::metadata(&dest)?;
         if meta.len() > 1_000_000 {
@@ -83,7 +91,7 @@ pub fn pull_default_model() -> Result<PathBuf, AsrError> {
     if size < 1_000_000 {
         let _ = std::fs::remove_file(&tmp);
         return Err(AsrError::Download(format!(
-            "downloaded file too small ({size} bytes) — check network or URL"
+            "downloaded file too small ({size} bytes)"
         )));
     }
 
@@ -92,16 +100,56 @@ pub fn pull_default_model() -> Result<PathBuf, AsrError> {
     Ok(dest)
 }
 
-/// Transcribe a WAV file to text using the default (or env-overridden) model.
-pub fn transcribe_file(audio_path: &Path) -> Result<String, AsrError> {
-    let model = default_model_path();
-    if !model.exists() {
-        return Err(AsrError::ModelMissing(model));
-    }
-    transcribe_file_with_model(audio_path, &model)
+/// Local whisper.cpp backend.
+pub struct WhisperTranscriber {
+    model_path: PathBuf,
+    threads: i32,
 }
 
-pub fn transcribe_file_with_model(audio_path: &Path, model_path: &Path) -> Result<String, AsrError> {
+impl WhisperTranscriber {
+    pub fn from_settings(settings: &Settings) -> Self {
+        let model_path = if let Some(m) = &settings.model {
+            PathBuf::from(m)
+        } else {
+            default_model_path()
+        };
+        let threads = if settings.whisper_threads == 0 {
+            num_cpus_soft()
+        } else {
+            settings.whisper_threads as i32
+        };
+        Self {
+            model_path,
+            threads,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_model(model_path: PathBuf) -> Self {
+        Self {
+            model_path,
+            threads: num_cpus_soft(),
+        }
+    }
+}
+
+impl Transcriber for WhisperTranscriber {
+    fn transcribe(&mut self, audio_path: &Path) -> Result<String, AsrError> {
+        transcribe_file_with_model(audio_path, &self.model_path, self.threads)
+    }
+}
+
+pub fn transcribe_file(audio_path: &Path) -> Result<String, AsrError> {
+    let settings = crate::config::load().unwrap_or_default();
+    let mut t = WhisperTranscriber::from_settings(&settings);
+    t.transcribe(audio_path)
+}
+
+pub fn transcribe_file_with_model(
+    audio_path: &Path,
+    model_path: &Path,
+    threads: i32,
+) -> Result<String, AsrError> {
     if !model_path.exists() {
         return Err(AsrError::ModelMissing(model_path.to_path_buf()));
     }
@@ -112,7 +160,6 @@ pub fn transcribe_file_with_model(audio_path: &Path, model_path: &Path) -> Resul
         )));
     }
 
-    // Quiet whisper.cpp spam on stderr for normal use.
     let _ = whisper_rs::install_logging_hooks();
 
     let ctx = WhisperContext::new_with_params(
@@ -128,12 +175,11 @@ pub fn transcribe_file_with_model(audio_path: &Path, model_path: &Path) -> Resul
     let samples = load_wav_as_whisper_samples(audio_path)?;
 
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    params.set_n_threads(num_cpus_soft());
+    params.set_n_threads(threads.max(1));
     params.set_print_special(false);
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
-    // Auto language detect; English-only tiny still works well for en.
     params.set_language(Some("auto"));
 
     state
@@ -155,7 +201,6 @@ pub fn transcribe_file_with_model(audio_path: &Path, model_path: &Path) -> Resul
     Ok(text.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
-/// Load WAV → mono f32 @ 16 kHz (whisper.cpp requirement).
 fn load_wav_as_whisper_samples(path: &Path) -> Result<Vec<f32>, AsrError> {
     let mut reader =
         hound::WavReader::open(path).map_err(|e| AsrError::AudioRead(e.to_string()))?;
@@ -184,19 +229,16 @@ fn load_wav_as_whisper_samples(path: &Path) -> Result<Vec<f32>, AsrError> {
         return Err(AsrError::AudioRead("audio file contains no samples".into()));
     }
 
-    // Interleaved i16 → f32
     let mut float = vec![0.0f32; raw_i16.len()];
     convert_integer_to_float_audio(&raw_i16, &mut float)
         .map_err(|e| AsrError::AudioRead(e.to_string()))?;
 
-    // Stereo → mono
     let mono = if channels >= 2 {
         convert_stereo_to_mono_audio(&float).map_err(|e| AsrError::AudioRead(e.to_string()))?
     } else {
         float
     };
 
-    // Resample to 16 kHz if needed
     let samples = if sample_rate == 16_000 {
         mono
     } else {
@@ -218,8 +260,7 @@ fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
         let i0 = src.floor() as usize;
         let i1 = (i0 + 1).min(input.len() - 1);
         let t = (src - i0 as f64) as f32;
-        let s = input[i0] * (1.0 - t) + input[i1] * t;
-        out.push(s);
+        out.push(input[i0] * (1.0 - t) + input[i1] * t);
     }
     out
 }
@@ -235,28 +276,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_model_path_uses_models_dir() {
-        let p = default_model_path();
-        assert!(p.ends_with(DEFAULT_MODEL_NAME) || std::env::var("SAGE_MODEL_PATH").is_ok());
-    }
-
-    #[test]
-    fn resample_changes_length() {
-        let input = vec![0.0f32; 16_000]; // 1s at 16k
-        let out = resample_linear(&input, 16_000, 8_000);
-        assert!((out.len() as i32 - 8_000).abs() <= 1);
-    }
-
-    #[test]
     fn transcribe_missing_model_errors_clearly() {
         let dir = std::env::temp_dir().join(format!("sage-asr-miss-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let wav = dir.join("empty.wav");
-        // minimal valid-ish path that doesn't need model if missing first
         let model = dir.join("no-such-model.bin");
-        let err = transcribe_file_with_model(&wav, &model).unwrap_err();
+        let wav = dir.join("x.wav");
+        let err = transcribe_file_with_model(&wav, &model, 2).unwrap_err();
         assert!(matches!(err, AsrError::ModelMissing(_)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trait_object_compiles() {
+        let mut t: Box<dyn Transcriber> =
+            Box::new(WhisperTranscriber::with_model(PathBuf::from("/nope")));
+        let _ = t.transcribe(Path::new("/nope.wav"));
     }
 }

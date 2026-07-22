@@ -1,10 +1,12 @@
-//! Sage — Linux voice-to-text.
-//!
-//! Phase 0: skeleton · Phase 1: recording · Phase 2: transcription
-
 mod asr;
 mod audio;
 mod config;
+mod daemon;
+mod decision;
+mod doctor;
+mod feedback;
+mod history;
+mod hotkey;
 mod output;
 mod paths;
 mod session;
@@ -27,52 +29,113 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Start recording from the default microphone (background worker)
+    /// Start recording (background worker)
     Start,
-    /// Stop recording, save WAV, and transcribe
+    /// Stop recording, transcribe, deliver text
     Stop,
-    /// Show session status (idle/recording), last paths, transcript
+    /// Cancel current recording without transcribing
+    Cancel,
+    /// Show session status
     Status,
-    /// Print the last transcript
+    /// Print last transcript
     Last,
-    /// Transcribe an existing audio file (WAV)
-    Transcribe {
-        /// Path to a WAV file
-        path: PathBuf,
-    },
+    /// Copy last transcript to clipboard
+    Copy,
+    /// Transcribe an existing WAV
+    Transcribe { path: PathBuf },
     /// Model management
     Model {
         #[command(subcommand)]
         action: ModelCmd,
     },
+    /// History
+    History {
+        #[command(subcommand)]
+        action: HistoryCmd,
+    },
+    /// Configuration
+    Config {
+        #[command(subcommand)]
+        action: ConfigCmd,
+    },
+    /// Hotkey shortcut config
+    Shortcut {
+        #[command(subcommand)]
+        action: ShortcutCmd,
+    },
+    /// Long-running control daemon (stdin commands)
+    Daemon,
+    /// Show whether daemon is running
+    #[command(name = "daemon-status")]
+    DaemonStatus,
+    /// Environment diagnostics
+    Doctor,
     /// Print resolved filesystem paths
     Paths,
-    /// Internal: background recorder worker (do not invoke directly)
+    /// Internal recorder worker
     #[command(name = "__worker", hide = true)]
     Worker,
 }
 
 #[derive(Subcommand, Debug)]
 enum ModelCmd {
-    /// Download the default whisper tiny model
     Pull,
-    /// Show the model path and whether it exists
     Path,
+}
+
+#[derive(Subcommand, Debug)]
+enum HistoryCmd {
+    /// List recent transcripts
+    List {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    Clear,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCmd {
+    Show,
+    Get { key: String },
+    Set { key: String, value: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum ShortcutCmd {
+    Show,
+    Set { chord: String },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-
     let result = match cli.command {
         Commands::Start => session::cmd_start(),
         Commands::Stop => session::cmd_stop(),
+        Commands::Cancel => session::cmd_cancel(),
         Commands::Status => session::cmd_status(),
         Commands::Last => session::cmd_last(),
+        Commands::Copy => session::cmd_copy_last(),
         Commands::Transcribe { path } => session::cmd_transcribe(&path),
         Commands::Model { action } => match action {
             ModelCmd::Pull => session::cmd_model_pull(),
             ModelCmd::Path => session::cmd_model_path(),
         },
+        Commands::History { action } => match action {
+            HistoryCmd::List { limit } => session::cmd_history_list(limit),
+            HistoryCmd::Clear => session::cmd_history_clear(),
+        },
+        Commands::Config { action } => match action {
+            ConfigCmd::Show => session::cmd_config_show(),
+            ConfigCmd::Get { key } => session::cmd_config_get(&key),
+            ConfigCmd::Set { key, value } => session::cmd_config_set(&key, &value),
+        },
+        Commands::Shortcut { action } => match action {
+            ShortcutCmd::Show => session::cmd_shortcut_show(),
+            ShortcutCmd::Set { chord } => session::cmd_shortcut_set(&chord),
+        },
+        Commands::Daemon => daemon::cmd_daemon(),
+        Commands::DaemonStatus => daemon::daemon_status(),
+        Commands::Doctor => doctor::run(),
         Commands::Paths => cmd_paths(),
         Commands::Worker => session::run_worker(),
     };
@@ -93,6 +156,7 @@ fn cmd_paths() -> Result<(), session::SessionError> {
     println!("data_dir:       {}", paths::data_dir().display());
     println!("recordings_dir: {}", paths::recordings_dir().display());
     println!("models_dir:     {}", paths::models_dir().display());
+    println!("history_file:   {}", paths::history_path().display());
     println!("run_dir:        {}", paths::run_dir().display());
     println!("state_file:     {}", paths::state_path().display());
     println!("temp_dir:       {}", paths::temp_dir().display());

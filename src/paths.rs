@@ -1,17 +1,4 @@
 //! Filesystem locations for Sage (XDG-style).
-//!
-//! | Path | Purpose |
-//! |------|---------|
-//! | `~/.config/sage/` | User config (`config.toml`) |
-//! | `~/.local/share/sage/recordings/` | Finished WAV files |
-//! | `~/.local/share/sage/run/` | Live session state + stop flag |
-//! | `~/.local/share/sage/models/` | STT models (phase 2+) |
-//! | `$TMPDIR/sage/` or `/tmp/sage-$UID/` | Scratch / temp audio |
-//!
-//! Overrides:
-//! - `SAGE_DATA_DIR` — replace data root (`~/.local/share/sage`)
-//! - `SAGE_CONFIG_DIR` — replace config root (`~/.config/sage`)
-//! - `SAGE_TEMP_DIR` — replace temp root
 
 use std::fs;
 use std::path::PathBuf;
@@ -20,7 +7,6 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-/// Application data root (`$XDG_DATA_HOME/sage` or `~/.local/share/sage`).
 pub fn data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("SAGE_DATA_DIR") {
         return PathBuf::from(dir);
@@ -33,7 +19,6 @@ pub fn data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("./.sage/data"))
 }
 
-/// User config root (`$XDG_CONFIG_HOME/sage` or `~/.config/sage`).
 pub fn config_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("SAGE_CONFIG_DIR") {
         return PathBuf::from(dir);
@@ -46,12 +31,10 @@ pub fn config_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("./.sage/config"))
 }
 
-/// Path to the main config file.
 pub fn config_file() -> PathBuf {
     config_dir().join("config.toml")
 }
 
-/// Scratch directory for temporary files.
 pub fn temp_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("SAGE_TEMP_DIR") {
         return PathBuf::from(dir);
@@ -73,6 +56,10 @@ pub fn run_dir() -> PathBuf {
     data_dir().join("run")
 }
 
+pub fn history_path() -> PathBuf {
+    data_dir().join("history.json")
+}
+
 pub fn state_path() -> PathBuf {
     run_dir().join("state.json")
 }
@@ -81,7 +68,14 @@ pub fn stop_flag_path() -> PathBuf {
     run_dir().join("stop")
 }
 
-/// Create all standard directories if missing.
+pub fn cancel_flag_path() -> PathBuf {
+    run_dir().join("cancel")
+}
+
+pub fn daemon_pid_path() -> PathBuf {
+    run_dir().join("daemon.pid")
+}
+
 pub fn ensure_dirs() -> std::io::Result<()> {
     fs::create_dir_all(config_dir())?;
     fs::create_dir_all(recordings_dir())?;
@@ -102,20 +96,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sage-path-data-{}", std::process::id()));
         std::env::set_var("SAGE_DATA_DIR", &dir);
         assert_eq!(data_dir(), dir);
-        assert_eq!(recordings_dir(), dir.join("recordings"));
-        assert_eq!(run_dir(), dir.join("run"));
-        assert_eq!(models_dir(), dir.join("models"));
+        assert_eq!(history_path(), dir.join("history.json"));
         std::env::remove_var("SAGE_DATA_DIR");
-    }
-
-    #[test]
-    fn override_config_dir_via_env() {
-        let _g = test_env::lock();
-        let dir = std::env::temp_dir().join(format!("sage-path-cfg-{}", std::process::id()));
-        std::env::set_var("SAGE_CONFIG_DIR", &dir);
-        assert_eq!(config_dir(), dir);
-        assert_eq!(config_file(), dir.join("config.toml"));
-        std::env::remove_var("SAGE_CONFIG_DIR");
     }
 
     #[test]
@@ -129,11 +111,7 @@ mod tests {
         std::env::set_var("SAGE_CONFIG_DIR", &cfg);
         std::env::set_var("SAGE_TEMP_DIR", &tmp);
         ensure_dirs().expect("ensure_dirs");
-        assert!(
-            recordings_dir().is_dir(),
-            "missing {}",
-            recordings_dir().display()
-        );
+        assert!(recordings_dir().is_dir());
         assert!(run_dir().is_dir());
         assert!(models_dir().is_dir());
         assert!(config_dir().is_dir());

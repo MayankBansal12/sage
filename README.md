@@ -1,76 +1,69 @@
 # Sage
 
-Linux voice-to-text CLI:
+Linux voice-to-text:
 
 ```text
-sage start → speak → sage stop → transcript
-```
-
-**Through Phase 2:** recording + local Whisper transcription.
-
-## Build deps (Debian/Ubuntu)
-
-```bash
-sudo apt-get install -y pkg-config libasound2-dev cmake clang libclang-dev
+sage start → speak → sage stop → text (+ clipboard)
 ```
 
 ## Build
 
 ```bash
-source "$HOME/.cargo/env"   # if needed
-cd /path/to/sage
+sudo apt-get install -y pkg-config libasound2-dev cmake clang libclang-dev
+source "$HOME/.cargo/env"
+cd sage
 cargo build --release
+./scripts/install.sh          # optional: ~/.local/bin/sage
 ```
 
-## Setup (once)
+## Setup
 
 ```bash
-./target/release/sage model pull    # downloads ggml-tiny.bin (~77MB)
-./target/release/sage model path
+sage model pull
+sage doctor
 ```
 
-## Run
+## Core usage
 
 ```bash
-./target/release/sage start     # needs a microphone
+sage start
 # speak…
-./target/release/sage stop      # saves WAV + prints transcript
-./target/release/sage last      # print last transcript
-./target/release/sage status
+sage stop          # transcribe + clipboard (default)
+sage last
+sage copy          # re-copy last transcript
+sage cancel        # abort recording
 ```
 
-Transcribe an existing WAV:
+Offline file:
 
 ```bash
-./target/release/sage transcribe /path/to/file.wav
+sage transcribe /path/to/audio.wav
 ```
 
-## Test
+## Config & history
 
 ```bash
-cargo test
+sage config show
+sage config set copy_to_clipboard true
+sage config set auto_paste false
+sage shortcut set ctrl+shift+r
+sage history list
 ```
 
-## Paths
+## Daemon
 
-| Path | Purpose |
-|------|---------|
-| `~/.local/share/sage/models/ggml-tiny.bin` | Default model |
-| `~/.local/share/sage/recordings/` | WAV files |
-| `~/.local/share/sage/run/state.json` | Session + last transcript |
+```bash
+sage daemon          # stdin: start|stop|cancel|status|quit
+sage daemon-status
+```
 
-Overrides: `SAGE_DATA_DIR`, `SAGE_MODEL_PATH`, `SAGE_CONFIG_DIR`, `SAGE_TEMP_DIR`.
+Point compositor hotkeys at `sage start` / `sage stop`, or pipe commands into the daemon.
 
-## CLI
+## Package
 
-| Command | Description |
-|---------|-------------|
-| `start` / `stop` | Record then transcribe |
-| `last` | Last transcript |
-| `status` | Session state |
-| `transcribe <wav>` | Transcribe file only |
-| `model pull` / `model path` | Download / locate model |
-| `paths` | Print all dirs |
+```bash
+./scripts/package.sh     # dist/sage-*-linux-x86_64.tar.gz
+```
 
 ## License
 

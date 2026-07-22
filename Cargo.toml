@@ -1,8 +1,8 @@
 [package]
 name = "sage"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "Linux voice-to-text (CLI; through Phase 2 transcription)"
+description = "Linux voice-to-text CLI (record → whisper → text)"
 license = "MIT"
 readme = "README.md"
 
@@ -12,7 +12,15 @@ cpal = "0.15"
 hound = "3.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 thiserror = "2"
 whisper-rs = "0.14"
 ureq = { version = "2", default-features = false, features = ["tls"] }
+toml = "0.8"
+arboard = "3"
+ctrlc = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
