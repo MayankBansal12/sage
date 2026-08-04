@@ -2,15 +2,16 @@ mod asr;
 mod audio;
 mod config;
 mod daemon;
-mod decision;
 mod doctor;
 mod feedback;
-mod history;
+mod global_hotkey;
 mod hotkey;
+mod ipc;
 mod output;
 mod paths;
 mod session;
-mod state;
+mod store;
+mod target;
 
 #[cfg(test)]
 mod test_env;
@@ -31,6 +32,8 @@ struct Cli {
 enum Commands {
     /// Start recording (background worker)
     Start,
+    /// Toggle recording: first invocation starts, second stops
+    Toggle,
     /// Stop recording, transcribe, deliver text
     Stop,
     /// Cancel current recording without transcribing
@@ -53,6 +56,19 @@ enum Commands {
         #[command(subcommand)]
         action: HistoryCmd,
     },
+    /// Show queued, transcribing, ready, and failed jobs
+    Pending {
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Deliver the oldest ready transcript to the focused field or clipboard
+    #[command(name = "paste-next")]
+    PasteNext,
+    /// Cancel a queued or pending job
+    #[command(name = "cancel-job")]
+    CancelJob { id: String },
+    /// Retry a failed or interrupted transcription
+    Retry { id: String },
     /// Configuration
     Config {
         #[command(subcommand)]
@@ -63,18 +79,21 @@ enum Commands {
         #[command(subcommand)]
         action: ShortcutCmd,
     },
-    /// Long-running control daemon (stdin commands)
+    /// Long-running recording, transcription, and delivery daemon
     Daemon,
     /// Show whether daemon is running
     #[command(name = "daemon-status")]
     DaemonStatus,
+    /// Stop the background daemon
+    #[command(name = "daemon-stop")]
+    DaemonStop,
     /// Environment diagnostics
     Doctor,
     /// Print resolved filesystem paths
     Paths,
-    /// Internal recorder worker
-    #[command(name = "__worker", hide = true)]
-    Worker,
+    /// Internal background daemon entrypoint
+    #[command(name = "__daemon", hide = true)]
+    BackgroundDaemon,
 }
 
 #[derive(Subcommand, Debug)]
@@ -110,6 +129,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Commands::Start => session::cmd_start(),
+        Commands::Toggle => session::cmd_toggle(),
         Commands::Stop => session::cmd_stop(),
         Commands::Cancel => session::cmd_cancel(),
         Commands::Status => session::cmd_status(),
@@ -124,6 +144,10 @@ fn main() -> ExitCode {
             HistoryCmd::List { limit } => session::cmd_history_list(limit),
             HistoryCmd::Clear => session::cmd_history_clear(),
         },
+        Commands::Pending { limit } => session::cmd_pending(limit),
+        Commands::PasteNext => session::cmd_paste_next(),
+        Commands::CancelJob { id } => session::cmd_cancel_job(&id),
+        Commands::Retry { id } => session::cmd_retry(&id),
         Commands::Config { action } => match action {
             ConfigCmd::Show => session::cmd_config_show(),
             ConfigCmd::Get { key } => session::cmd_config_get(&key),
@@ -135,9 +159,10 @@ fn main() -> ExitCode {
         },
         Commands::Daemon => daemon::cmd_daemon(),
         Commands::DaemonStatus => daemon::daemon_status(),
+        Commands::DaemonStop => session::cmd_daemon_stop(),
         Commands::Doctor => doctor::run(),
         Commands::Paths => cmd_paths(),
-        Commands::Worker => session::run_worker(),
+        Commands::BackgroundDaemon => daemon::run_background(),
     };
 
     match result {
@@ -156,9 +181,9 @@ fn cmd_paths() -> Result<(), session::SessionError> {
     println!("data_dir:       {}", paths::data_dir().display());
     println!("recordings_dir: {}", paths::recordings_dir().display());
     println!("models_dir:     {}", paths::models_dir().display());
-    println!("history_file:   {}", paths::history_path().display());
+    println!("database_file:  {}", paths::database_path().display());
     println!("run_dir:        {}", paths::run_dir().display());
-    println!("state_file:     {}", paths::state_path().display());
+    println!("daemon_socket:  {}", paths::daemon_socket_path().display());
     println!("temp_dir:       {}", paths::temp_dir().display());
     println!("model_file:     {}", asr::default_model_path().display());
     Ok(())

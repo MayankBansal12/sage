@@ -23,7 +23,7 @@ case ":$PATH:" in
   *) echo "note: add $INSTALL_DIR to PATH if needed" ;;
 esac
 
-if [[ "${SAGE_INSTALL_SERVICE:-0}" == "1" ]]; then
+if [[ "${SAGE_INSTALL_SERVICE:-1}" == "1" ]]; then
   mkdir -p "$UNIT_DIR"
   cat > "$UNIT_DIR/sage.service" <<EOF
 [Unit]
@@ -32,15 +32,18 @@ After=default.target
 
 [Service]
 Type=simple
-ExecStart=$INSTALL_DIR/sage daemon
+ExecStart="$INSTALL_DIR/sage" daemon
 Restart=on-failure
+RestartSec=1
 
 [Install]
 WantedBy=default.target
 EOF
-  systemctl --user daemon-reload || true
-  systemctl --user enable --now sage.service || true
-  echo "systemd user unit: sage.service enabled"
+  if systemctl --user daemon-reload && systemctl --user enable --now sage.service; then
+    echo "systemd user unit: sage.service enabled"
+  else
+    echo "warning: could not enable sage.service; use a desktop shortcut that runs 'sage toggle'" >&2
+  fi
 fi
 
 echo "next:"

@@ -1,9 +1,9 @@
 # Sage
 
-Linux voice-to-text:
+Queued Linux voice-to-text with target-aware delivery:
 
 ```text
-sage start → speak → sage stop → text (+ clipboard)
+focus a text field → hotkey → speak → hotkey → transcript returns to that field
 ```
 
 ## Build
@@ -29,6 +29,7 @@ sage doctor
 sage start
 # speak…
 sage stop          # transcribe + clipboard (default)
+sage toggle        # recommended global-shortcut command
 sage last
 sage copy          # re-copy last transcript
 sage cancel        # abort recording
@@ -48,16 +49,30 @@ sage config set copy_to_clipboard true
 sage config set auto_paste false
 sage shortcut set ctrl+shift+r
 sage history list
+sage pending
+sage paste-next
 ```
 
 ## Daemon
 
 ```bash
-sage daemon          # stdin: start|stop|cancel|status|quit
+sage daemon          # foreground daemon
 sage daemon-status
+sage daemon-stop
 ```
 
-Point compositor hotkeys at `sage start` / `sage stop`, or pipe commands into the daemon.
+On GNOME Wayland, Sage requests the configured shortcut through the Global
+Shortcuts portal. If the desktop does not expose that portal, bind a desktop or
+compositor shortcut to `sage toggle`; the command talks to the same daemon.
+
+Sage captures the focused AT-SPI editable component when recording begins.
+Transcription runs in a durable background queue. When that component regains
+focus, ready transcripts are inserted in recording order. Ambiguous,
+unsupported, closed, or expired targets remain available through `sage pending`
+and `sage paste-next`.
+
+Native GTK/Qt controls are the primary v1 target. Browser, Electron, terminal,
+KDE Wayland, and X11 behavior is best-effort until dedicated adapters are added.
 
 ## Package
 

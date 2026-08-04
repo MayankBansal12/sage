@@ -21,12 +21,20 @@ fn sage_bin() -> PathBuf {
 
 fn run_sage(data_dir: &PathBuf, args: &[&str]) -> std::process::Output {
     let cfg = data_dir.join("cfg");
-    Command::new(sage_bin())
+    let output = Command::new(sage_bin())
         .args(args)
         .env("SAGE_DATA_DIR", data_dir)
         .env("SAGE_CONFIG_DIR", &cfg)
         .output()
-        .expect("failed to run sage")
+        .expect("failed to run sage");
+    if args.first().copied() != Some("daemon-stop") {
+        let _ = Command::new(sage_bin())
+            .arg("daemon-stop")
+            .env("SAGE_DATA_DIR", data_dir)
+            .env("SAGE_CONFIG_DIR", &cfg)
+            .output();
+    }
+    output
 }
 
 #[test]
@@ -34,7 +42,11 @@ fn status_when_idle_shows_idle() {
     let data = unique_data_dir();
     let out = run_sage(&data, &["status"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(stdout.contains("status: idle"), "{stdout}");
 }
 
@@ -69,7 +81,11 @@ fn cancel_when_idle_fails() {
 fn config_set_and_show() {
     let data = unique_data_dir();
     let out = run_sage(&data, &["config", "set", "hotkey", "ctrl+shift+r"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let out = run_sage(&data, &["config", "get", "hotkey"]);
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("ctrl+shift+r"));
@@ -81,7 +97,11 @@ fn config_set_and_show() {
 fn history_empty_list() {
     let data = unique_data_dir();
     let out = run_sage(&data, &["history", "list"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(String::from_utf8_lossy(&out.stdout).contains("no history"));
 }
 
@@ -90,13 +110,17 @@ fn paths_prints_layout() {
     let data = unique_data_dir();
     let out = run_sage(&data, &["paths"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(stdout.contains("history_file:"));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("database_file:"));
     assert!(stdout.contains("data_dir:"));
 }
 
 #[test]
-fn double_start_is_rejected_if_fake_worker_alive() {
+fn legacy_state_file_cannot_claim_a_recording() {
     let data = unique_data_dir();
     let run = data.join("run");
     fs::create_dir_all(&run).unwrap();
@@ -112,17 +136,19 @@ fn double_start_is_rejected_if_fake_worker_alive() {
         std::process::id()
     );
     fs::write(run.join("state.json"), state).unwrap();
-    let out = run_sage(&data, &["start"]);
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr)
-        .to_lowercase()
-        .contains("already recording"));
+    let out = run_sage(&data, &["status"]);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("status: idle"));
 }
 
 #[test]
 fn doctor_runs() {
     let data = unique_data_dir();
     let out = run_sage(&data, &["doctor"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(String::from_utf8_lossy(&out.stdout).contains("sage doctor"));
 }

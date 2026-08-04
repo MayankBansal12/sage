@@ -1,13 +1,12 @@
 //! Microphone capture via cpal, written to a WAV file on stop.
 
-use crate::paths::stop_flag_path;
-use crate::state::stop_requested;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample};
 use hound::{WavSpec, WavWriter};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -27,18 +26,23 @@ pub enum AudioError {
     Io(#[from] std::io::Error),
     #[error("no audio samples captured")]
     NoSamples,
+    #[error("audio stream failed: {0}")]
+    Stream(String),
 }
 
-/// Record from the default microphone until a stop is requested (stop flag file)
-/// or `max_duration` elapses. Writes a mono/stereo WAV to `output_path`.
-///
-/// `on_stream_ready` is invoked once the input stream is playing so the caller
-/// can publish "recording armed" state before samples accumulate.
-pub fn record_until_stop<F>(
+#[derive(Debug, Clone)]
+pub struct RecordingInfo {
+    pub path: PathBuf,
+    pub duration: Duration,
+}
+
+/// Stream microphone samples directly to disk until `stop` becomes true.
+pub fn record_until_signal<F>(
     output_path: &Path,
     max_duration: Duration,
+    stop: Arc<AtomicBool>,
     on_stream_ready: F,
-) -> Result<PathBuf, AudioError>
+) -> Result<RecordingInfo, AudioError>
 where
     F: FnOnce() -> Result<(), AudioError>,
 {
@@ -56,28 +60,33 @@ where
     let channels = stream_config.channels;
     let sample_rate = stream_config.sample_rate.0;
 
-    let samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
     let err_flag = Arc::new(AtomicBool::new(false));
 
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let spec = WavSpec {
+        channels,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let writer = WavWriter::create(output_path, spec)
+        .map_err(|error| AudioError::WavWrite(error.to_string()))?;
+    std::fs::set_permissions(output_path, std::fs::Permissions::from_mode(0o600))?;
+    let (sample_tx, sample_rx) = mpsc::sync_channel::<Vec<i16>>(32);
+    let writer_thread = std::thread::spawn(move || write_chunks(writer, sample_rx));
+
     let stream = match sample_format {
-        SampleFormat::I16 => build_stream::<i16>(
-            &device,
-            &stream_config,
-            samples.clone(),
-            err_flag.clone(),
-        )?,
-        SampleFormat::U16 => build_stream::<u16>(
-            &device,
-            &stream_config,
-            samples.clone(),
-            err_flag.clone(),
-        )?,
-        SampleFormat::F32 => build_stream::<f32>(
-            &device,
-            &stream_config,
-            samples.clone(),
-            err_flag.clone(),
-        )?,
+        SampleFormat::I16 => {
+            build_stream::<i16>(&device, &stream_config, sample_tx.clone(), err_flag.clone())?
+        }
+        SampleFormat::U16 => {
+            build_stream::<u16>(&device, &stream_config, sample_tx.clone(), err_flag.clone())?
+        }
+        SampleFormat::F32 => {
+            build_stream::<f32>(&device, &stream_config, sample_tx.clone(), err_flag.clone())?
+        }
         sample_format => {
             return Err(AudioError::BuildStream(format!(
                 "unsupported sample format: {sample_format:?}"
@@ -93,42 +102,41 @@ where
 
     let started = Instant::now();
     // Poll stop flag; also exit if the stop flag path's parent disappears (cleanup).
-    while !stop_requested() && started.elapsed() < max_duration {
+    while !stop.load(Ordering::SeqCst) && started.elapsed() < max_duration {
         if err_flag.load(Ordering::SeqCst) {
             break;
         }
         // Cheap poll — stop flag is a tiny file create from `sage stop`.
         std::thread::sleep(Duration::from_millis(40));
-        // If run dir was wiped, bail.
-        if !stop_flag_path()
-            .parent()
-            .map(|p| p.exists())
-            .unwrap_or(false)
-        {
-            break;
-        }
     }
 
     // Drop stream to stop callbacks before reading samples.
     drop(stream);
+    drop(sample_tx);
+    let written = writer_thread
+        .join()
+        .map_err(|_| AudioError::WavWrite("WAV writer thread panicked".into()))??;
 
-    let captured = samples
-        .lock()
-        .map_err(|_| AudioError::WavWrite("sample buffer lock poisoned".into()))?
-        .clone();
-
-    if captured.is_empty() {
+    if err_flag.load(Ordering::SeqCst) {
+        return Err(AudioError::Stream(
+            "capture callback failed or the disk writer could not keep up".into(),
+        ));
+    }
+    if written == 0 {
         return Err(AudioError::NoSamples);
     }
-
-    write_wav(output_path, sample_rate, channels, &captured)?;
-    Ok(output_path.to_path_buf())
+    let frames = written as f64 / f64::from(channels);
+    let duration = Duration::from_secs_f64(frames / f64::from(sample_rate));
+    Ok(RecordingInfo {
+        path: output_path.to_path_buf(),
+        duration,
+    })
 }
 
 fn build_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    samples: Arc<Mutex<Vec<f32>>>,
+    sender: mpsc::SyncSender<Vec<i16>>,
     err_flag: Arc<AtomicBool>,
 ) -> Result<cpal::Stream, AudioError>
 where
@@ -140,15 +148,15 @@ where
         .build_input_stream(
             config,
             move |data: &[T], _| {
-                let mut buf = match samples.lock() {
-                    Ok(b) => b,
-                    Err(_) => {
-                        err_flag.store(true, Ordering::SeqCst);
-                        return;
-                    }
-                };
-                for &sample in data {
-                    buf.push(f32::from_sample(sample));
+                let converted = data
+                    .iter()
+                    .map(|&sample| {
+                        let value = f32::from_sample(sample).clamp(-1.0, 1.0);
+                        (value * i16::MAX as f32) as i16
+                    })
+                    .collect();
+                if sender.try_send(converted).is_err() {
+                    err_flag.store(true, Ordering::SeqCst);
                 }
             },
             move |err| {
@@ -161,6 +169,26 @@ where
     Ok(stream)
 }
 
+fn write_chunks(
+    mut writer: WavWriter<std::io::BufWriter<std::fs::File>>,
+    receiver: mpsc::Receiver<Vec<i16>>,
+) -> Result<u64, AudioError> {
+    let mut written = 0u64;
+    for chunk in receiver {
+        for sample in chunk {
+            writer
+                .write_sample(sample)
+                .map_err(|error| AudioError::WavWrite(error.to_string()))?;
+            written += 1;
+        }
+    }
+    writer
+        .finalize()
+        .map_err(|error| AudioError::WavWrite(error.to_string()))?;
+    Ok(written)
+}
+
+#[cfg(test)]
 fn write_wav(
     path: &Path,
     sample_rate: u32,

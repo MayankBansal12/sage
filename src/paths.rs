@@ -1,6 +1,7 @@
 //! Filesystem locations for Sage (XDG-style).
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 fn home_dir() -> Option<PathBuf> {
@@ -40,7 +41,8 @@ pub fn temp_dir() -> PathBuf {
         return PathBuf::from(dir);
     }
     let base = std::env::temp_dir();
-    let uid = std::env::var("UID").unwrap_or_else(|_| "user".into());
+    // SAFETY: `geteuid` takes no arguments and has no memory-safety preconditions.
+    let uid = unsafe { libc::geteuid() };
     base.join(format!("sage-{uid}"))
 }
 
@@ -56,32 +58,34 @@ pub fn run_dir() -> PathBuf {
     data_dir().join("run")
 }
 
-pub fn history_path() -> PathBuf {
+pub fn database_path() -> PathBuf {
+    data_dir().join("sage.db")
+}
+
+pub fn legacy_history_path() -> PathBuf {
     data_dir().join("history.json")
-}
-
-pub fn state_path() -> PathBuf {
-    run_dir().join("state.json")
-}
-
-pub fn stop_flag_path() -> PathBuf {
-    run_dir().join("stop")
-}
-
-pub fn cancel_flag_path() -> PathBuf {
-    run_dir().join("cancel")
 }
 
 pub fn daemon_pid_path() -> PathBuf {
     run_dir().join("daemon.pid")
 }
 
+pub fn daemon_socket_path() -> PathBuf {
+    run_dir().join("sage.sock")
+}
+
 pub fn ensure_dirs() -> std::io::Result<()> {
-    fs::create_dir_all(config_dir())?;
-    fs::create_dir_all(recordings_dir())?;
-    fs::create_dir_all(models_dir())?;
-    fs::create_dir_all(run_dir())?;
-    fs::create_dir_all(temp_dir())?;
+    for directory in [
+        config_dir(),
+        data_dir(),
+        recordings_dir(),
+        models_dir(),
+        run_dir(),
+        temp_dir(),
+    ] {
+        fs::create_dir_all(&directory)?;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+    }
     Ok(())
 }
 
@@ -96,7 +100,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sage-path-data-{}", std::process::id()));
         std::env::set_var("SAGE_DATA_DIR", &dir);
         assert_eq!(data_dir(), dir);
-        assert_eq!(history_path(), dir.join("history.json"));
+        assert_eq!(database_path(), dir.join("sage.db"));
         std::env::remove_var("SAGE_DATA_DIR");
     }
 
@@ -120,5 +124,23 @@ mod tests {
         std::env::remove_var("SAGE_CONFIG_DIR");
         std::env::remove_var("SAGE_TEMP_DIR");
         let _ = fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn default_temp_dir_uses_process_uid_without_environment() {
+        let _g = test_env::lock();
+        let previous_temp = std::env::var_os("SAGE_TEMP_DIR");
+        let previous_uid = std::env::var_os("UID");
+        std::env::remove_var("SAGE_TEMP_DIR");
+        std::env::remove_var("UID");
+        // SAFETY: `geteuid` takes no arguments and has no memory-safety preconditions.
+        let expected = std::env::temp_dir().join(format!("sage-{}", unsafe { libc::geteuid() }));
+        assert_eq!(temp_dir(), expected);
+        if let Some(value) = previous_temp {
+            std::env::set_var("SAGE_TEMP_DIR", value);
+        }
+        if let Some(value) = previous_uid {
+            std::env::set_var("UID", value);
+        }
     }
 }
