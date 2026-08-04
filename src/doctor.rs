@@ -4,8 +4,6 @@ use crate::asr;
 use crate::config;
 use crate::hotkey::HotKey;
 use crate::paths;
-use crate::state::{load_state, process_is_alive, SessionStatus};
-use std::process::Command;
 
 pub fn run() -> Result<(), crate::session::SessionError> {
     paths::ensure_dirs().map_err(crate::session::SessionError::from)?;
@@ -16,10 +14,12 @@ pub fn run() -> Result<(), crate::session::SessionError> {
         Ok(format!("{}", std::env::current_exe()?.display()))
     });
 
-    check("config_dir", || Ok(paths::config_dir().display().to_string()));
+    check("config_dir", || {
+        Ok(paths::config_dir().display().to_string())
+    });
     check("data_dir", || Ok(paths::data_dir().display().to_string()));
 
-    let settings = config::load().unwrap_or_default();
+    let settings = config::load()?;
     check("config", || {
         Ok(format!(
             "hotkey={} copy={} paste={}",
@@ -34,17 +34,23 @@ pub fn run() -> Result<(), crate::session::SessionError> {
 
     let model = asr::default_model_path();
     if model.exists() {
-        let mb = std::fs::metadata(&model).map(|m| m.len() / 1_000_000).unwrap_or(0);
+        let mb = std::fs::metadata(&model)
+            .map(|m| m.len() / 1_000_000)
+            .unwrap_or(0);
         println!("[ OK ] model: {} ({} MB)", model.display(), mb);
     } else {
-        println!("[FAIL] model: missing at {} — run `sage model pull`", model.display());
+        println!(
+            "[FAIL] model: missing at {} — run `sage model pull`",
+            model.display()
+        );
     }
 
     // Mic
-    match {
+    let microphone = {
         use cpal::traits::HostTrait;
         cpal::default_host().default_input_device()
-    } {
+    };
+    match microphone {
         Some(d) => {
             use cpal::traits::DeviceTrait;
             let name = d.name().unwrap_or_else(|_| "unknown".into());
@@ -61,31 +67,9 @@ pub fn run() -> Result<(), crate::session::SessionError> {
         Err(e) => println!("[WARN] clipboard: {e}"),
     }
 
-    // Paste helpers
-    for bin in ["wtype", "xdotool", "ydotool"] {
-        if which(bin) {
-            println!("[ OK ] paste helper: {bin}");
-        }
-    }
-    if !["wtype", "xdotool", "ydotool"].iter().any(|b| which(b)) {
-        println!("[WARN] paste helper: none found (auto_paste limited)");
-    }
-
-    // Session
-    match load_state() {
-        Ok(s) => {
-            println!("[ OK ] session: {}", s.status);
-            if s.status == SessionStatus::Recording {
-                if let Some(pid) = s.worker_pid {
-                    if process_is_alive(pid) {
-                        println!("[ OK ] recorder worker pid {pid} alive");
-                    } else {
-                        println!("[WARN] recorder worker pid {pid} dead (stale state)");
-                    }
-                }
-            }
-        }
-        Err(e) => println!("[FAIL] session: {e}"),
+    match crate::ipc::request(&crate::ipc::DaemonCommand::Status, false) {
+        Ok(response) if response.ok => println!("[ OK ] daemon: running"),
+        _ => println!("[WARN] daemon: not running (it starts automatically on first toggle)"),
     }
 
     println!();
@@ -102,14 +86,4 @@ fn check(name: &str, f: impl FnOnce() -> std::io::Result<String>) {
         Ok(v) => println!("[ OK ] {name}: {v}"),
         Err(e) => println!("[FAIL] {name}: {e}"),
     }
-}
-
-fn which(bin: &str) -> bool {
-    Command::new("which")
-        .arg(bin)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }

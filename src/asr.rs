@@ -1,13 +1,11 @@
-//! Speech-to-text via whisper-rs (whisper.cpp) — modular Transcriber trait (phase 8).
+//! Speech-to-text via whisper-rs with a daemon-retained Whisper context.
 
-use crate::config::Settings;
 use crate::paths::{ensure_dirs, models_dir};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use thiserror::Error;
-use whisper_rs::{
-    convert_integer_to_float_audio, convert_stereo_to_mono_audio, FullParams, SamplingStrategy,
-    WhisperContext, WhisperContextParameters,
-};
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 pub const DEFAULT_MODEL_NAME: &str = "ggml-tiny.bin";
 pub const DEFAULT_MODEL_URL: &str =
@@ -29,11 +27,6 @@ pub enum AsrError {
     Io(#[from] std::io::Error),
 }
 
-/// Extension point for future backends (local whisper, remote API, …).
-pub trait Transcriber {
-    fn transcribe(&mut self, audio_path: &Path) -> Result<String, AsrError>;
-}
-
 pub fn default_model_path() -> PathBuf {
     if let Ok(p) = std::env::var("SAGE_MODEL_PATH") {
         return PathBuf::from(p);
@@ -48,14 +41,7 @@ pub fn default_model_path() -> PathBuf {
 
 pub fn pull_default_model() -> Result<PathBuf, AsrError> {
     ensure_dirs()?;
-    let dest = {
-        // Prefer default models dir name even if SAGE_MODEL_PATH set for pull target
-        if let Ok(p) = std::env::var("SAGE_MODEL_PATH") {
-            PathBuf::from(p)
-        } else {
-            models_dir().join(DEFAULT_MODEL_NAME)
-        }
-    };
+    let dest = default_model_path();
     if dest.exists() {
         let meta = std::fs::metadata(&dest)?;
         if meta.len() > 1_000_000 {
@@ -71,7 +57,12 @@ pub fn pull_default_model() -> Result<PathBuf, AsrError> {
     eprintln!("  to:   {}", dest.display());
 
     let tmp = dest.with_extension("bin.partial");
-    let response = ureq::get(DEFAULT_MODEL_URL)
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(Duration::from_secs(120))
+        .build();
+    let response = agent
+        .get(DEFAULT_MODEL_URL)
         .call()
         .map_err(|e| AsrError::Download(e.to_string()))?;
 
@@ -84,6 +75,7 @@ pub fn pull_default_model() -> Result<PathBuf, AsrError> {
 
     let mut reader = response.into_reader();
     let mut file = std::fs::File::create(&tmp)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
     std::io::copy(&mut reader, &mut file)?;
     drop(file);
 
@@ -100,51 +92,7 @@ pub fn pull_default_model() -> Result<PathBuf, AsrError> {
     Ok(dest)
 }
 
-/// Local whisper.cpp backend.
-pub struct WhisperTranscriber {
-    model_path: PathBuf,
-    threads: i32,
-}
-
-impl WhisperTranscriber {
-    pub fn from_settings(settings: &Settings) -> Self {
-        let model_path = if let Some(m) = &settings.model {
-            PathBuf::from(m)
-        } else {
-            default_model_path()
-        };
-        let threads = if settings.whisper_threads == 0 {
-            num_cpus_soft()
-        } else {
-            settings.whisper_threads as i32
-        };
-        Self {
-            model_path,
-            threads,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn with_model(model_path: PathBuf) -> Self {
-        Self {
-            model_path,
-            threads: num_cpus_soft(),
-        }
-    }
-}
-
-impl Transcriber for WhisperTranscriber {
-    fn transcribe(&mut self, audio_path: &Path) -> Result<String, AsrError> {
-        transcribe_file_with_model(audio_path, &self.model_path, self.threads)
-    }
-}
-
-pub fn transcribe_file(audio_path: &Path) -> Result<String, AsrError> {
-    let settings = crate::config::load().unwrap_or_default();
-    let mut t = WhisperTranscriber::from_settings(&settings);
-    t.transcribe(audio_path)
-}
-
+#[cfg(test)]
 pub fn transcribe_file_with_model(
     audio_path: &Path,
     model_path: &Path,
@@ -160,15 +108,23 @@ pub fn transcribe_file_with_model(
         )));
     }
 
-    let _ = whisper_rs::install_logging_hooks();
+    whisper_rs::install_logging_hooks();
 
-    let ctx = WhisperContext::new_with_params(
+    let context = WhisperContext::new_with_params(
         model_path.to_string_lossy().as_ref(),
         WhisperContextParameters::default(),
     )
     .map_err(|e| AsrError::LoadModel(e.to_string()))?;
 
-    let mut state = ctx
+    transcribe_with_context(audio_path, &context, threads)
+}
+
+fn transcribe_with_context(
+    audio_path: &Path,
+    context: &WhisperContext,
+    threads: i32,
+) -> Result<String, AsrError> {
+    let mut state = context
         .create_state()
         .map_err(|e| AsrError::LoadModel(e.to_string()))?;
 
@@ -208,35 +164,54 @@ fn load_wav_as_whisper_samples(path: &Path) -> Result<Vec<f32>, AsrError> {
     let sample_rate = spec.sample_rate;
     let channels = spec.channels as usize;
 
-    let raw_i16: Vec<i16> = match spec.sample_format {
-        hound::SampleFormat::Int => reader
-            .samples::<i16>()
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| AsrError::AudioRead(e.to_string()))?,
-        hound::SampleFormat::Float => {
-            let floats: Vec<f32> = reader
+    if channels == 0 {
+        return Err(AsrError::AudioRead(
+            "audio file reports zero channels".into(),
+        ));
+    }
+
+    let interleaved: Vec<f32> =
+        match (spec.sample_format, spec.bits_per_sample) {
+            (hound::SampleFormat::Int, 1..=8) => reader
+                .samples::<i8>()
+                .map(|sample| sample.map(|value| f32::from(value) / i8::MAX as f32))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| AsrError::AudioRead(error.to_string()))?,
+            (hound::SampleFormat::Int, 9..=16) => reader
+                .samples::<i16>()
+                .map(|sample| sample.map(|value| f32::from(value) / i16::MAX as f32))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| AsrError::AudioRead(error.to_string()))?,
+            (hound::SampleFormat::Int, 17..=32) => {
+                let maximum = ((1_i64 << (spec.bits_per_sample - 1)) - 1) as f32;
+                reader
+                    .samples::<i32>()
+                    .map(|sample| sample.map(|value| value as f32 / maximum))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| AsrError::AudioRead(error.to_string()))?
+            }
+            (hound::SampleFormat::Float, _) => reader
                 .samples::<f32>()
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| AsrError::AudioRead(e.to_string()))?;
-            floats
-                .into_iter()
-                .map(|f| (f.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
-                .collect()
-        }
-    };
+                .map_err(|error| AsrError::AudioRead(error.to_string()))?,
+            (_, bits) => {
+                return Err(AsrError::AudioRead(format!(
+                    "unsupported WAV bit depth: {bits}"
+                )))
+            }
+        };
 
-    if raw_i16.is_empty() {
+    if interleaved.is_empty() {
         return Err(AsrError::AudioRead("audio file contains no samples".into()));
     }
 
-    let mut float = vec![0.0f32; raw_i16.len()];
-    convert_integer_to_float_audio(&raw_i16, &mut float)
-        .map_err(|e| AsrError::AudioRead(e.to_string()))?;
-
-    let mono = if channels >= 2 {
-        convert_stereo_to_mono_audio(&float).map_err(|e| AsrError::AudioRead(e.to_string()))?
+    let mono = if channels > 1 {
+        interleaved
+            .chunks_exact(channels)
+            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+            .collect()
     } else {
-        float
+        interleaved
     };
 
     let samples = if sample_rate == 16_000 {
@@ -246,6 +221,59 @@ fn load_wav_as_whisper_samples(path: &Path) -> Result<Vec<f32>, AsrError> {
     };
 
     Ok(samples)
+}
+
+/// Whisper engine retained by the daemon's serial worker between jobs.
+pub struct PersistentWhisper {
+    model_path: Option<PathBuf>,
+    context: Option<WhisperContext>,
+}
+
+impl PersistentWhisper {
+    pub fn new() -> Self {
+        Self {
+            model_path: None,
+            context: None,
+        }
+    }
+
+    pub fn transcribe(&mut self, audio_path: &Path) -> Result<String, AsrError> {
+        let settings =
+            crate::config::load().map_err(|error| AsrError::LoadModel(error.to_string()))?;
+        let model_path = settings
+            .model
+            .map(PathBuf::from)
+            .unwrap_or_else(default_model_path);
+        if !model_path.exists() {
+            return Err(AsrError::ModelMissing(model_path));
+        }
+        if self.model_path.as_ref() != Some(&model_path) || self.context.is_none() {
+            whisper_rs::install_logging_hooks();
+            self.context = Some(
+                WhisperContext::new_with_params(
+                    model_path.to_string_lossy().as_ref(),
+                    WhisperContextParameters::default(),
+                )
+                .map_err(|error| AsrError::LoadModel(error.to_string()))?,
+            );
+            self.model_path = Some(model_path);
+        }
+        let threads = if settings.whisper_threads == 0 {
+            num_cpus_soft()
+        } else {
+            i32::try_from(settings.whisper_threads).unwrap_or(i32::MAX)
+        };
+        transcribe_with_context(
+            audio_path,
+            self.context.as_ref().expect("context loaded"),
+            threads,
+        )
+    }
+
+    pub fn unload(&mut self) {
+        self.context = None;
+        self.model_path = None;
+    }
 }
 
 fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
@@ -285,12 +313,5 @@ mod tests {
         let err = transcribe_file_with_model(&wav, &model, 2).unwrap_err();
         assert!(matches!(err, AsrError::ModelMissing(_)));
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn trait_object_compiles() {
-        let mut t: Box<dyn Transcriber> =
-            Box::new(WhisperTranscriber::with_model(PathBuf::from("/nope")));
-        let _ = t.transcribe(Path::new("/nope.wav"));
     }
 }

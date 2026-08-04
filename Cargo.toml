@@ -19,6 +19,14 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 toml = "0.8"
 arboard = "3"
 ctrlc = "3"
+rusqlite = { version = "0.40", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+futures-util = "0.3"
+fs2 = "0.4"
+libc = "0.2"
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "global_shortcuts"] }
+atspi = { version = "0.30", features = ["tokio", "zbus"] }
 
 [profile.release]
 lto = true
