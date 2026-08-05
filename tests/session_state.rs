@@ -91,6 +91,51 @@ fn config_set_and_show() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("ctrl+shift+r"));
     let out = run_sage(&data, &["shortcut", "show"]);
     assert!(out.status.success());
+
+    let out = run_sage(&data, &["config", "set", "language", "de"]);
+    assert!(out.status.success());
+    let out = run_sage(&data, &["config", "get", "language"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "de");
+}
+
+#[test]
+fn model_catalog_lists_and_describes_models_without_network() {
+    let data = unique_data_dir();
+    let out = run_sage(&data, &["model", "list"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("parakeet-unified-en-0.6b"), "{stdout}");
+    assert!(stdout.contains("qwen3-asr-0.6b"), "{stdout}");
+
+    let out = run_sage(&data, &["model", "info", "canary-180m-flash"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("CC-BY-4.0"), "{stdout}");
+    assert!(stdout.contains("en, de, es, fr"), "{stdout}");
+}
+
+#[test]
+fn model_commands_reject_unknown_or_unselected_models() {
+    let data = unique_data_dir();
+    let out = run_sage(&data, &["model", "use", "not-a-model"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown model"));
+
+    let out = run_sage(&data, &["model", "current"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no transcription model selected"));
+
+    let out = run_sage(&data, &["config", "set", "model", "/tmp/model.bin"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("sage model use"));
 }
 
 #[test]

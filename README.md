@@ -1,6 +1,6 @@
 # Sage
 
-Queued Linux voice-to-text with target-aware delivery:
+Fast, offline Linux voice-to-text with target-aware delivery:
 
 ```text
 focus a text field → hotkey → speak → hotkey → transcript returns to that field
@@ -19,9 +19,41 @@ cargo build --release
 ## Setup
 
 ```bash
-sage model pull
+sage model list
+sage model use parakeet-unified-en-0.6b
 sage doctor
 ```
+
+`model use` downloads, verifies, and selects the model in one command. Use
+`--language <code>` for an explicit language when a model supports more than
+one, for example `sage model use canary-180m-flash --language de`.
+
+## Speech-to-text models
+
+Sage ships an offline catalog rather than downloading a live model list. Model
+files come from pinned Hugging Face revisions and are verified with SHA-256
+before they become active.
+
+| Model | Best for | Download |
+| --- | --- | ---: |
+| `parakeet-unified-en-0.6b` | Fast, accurate English (recommended) | 697 MiB |
+| `canary-180m-flash` | Fast English, German, Spanish, or French | 208 MiB |
+| `whisper-medium` | Reliable automatic detection across 99 languages | 793 MiB |
+| `moonshine-streaming-tiny` | Smallest and fastest English option | 48 MiB |
+| `qwen3-asr-0.6b` | Accurate automatic detection across 30 languages | 811 MiB |
+
+```bash
+sage model list
+sage model info qwen3-asr-0.6b
+sage model use qwen3-asr-0.6b
+sage model current
+sage model pull whisper-medium   # download without selecting
+```
+
+The first release uses the portable CPU backend. Models advertising streaming
+support still run in Sage's record-then-transcribe flow; live preview and GPU
+acceleration are intentionally deferred. See [MODEL_LICENSES.md](MODEL_LICENSES.md)
+for model licenses and attribution.
 
 ## Core usage
 
@@ -47,6 +79,8 @@ sage transcribe /path/to/audio.wav
 sage config show
 sage config set copy_to_clipboard true
 sage config set auto_paste false
+sage config set language auto
+sage config set stt_threads 0
 sage shortcut set ctrl+shift+r
 sage history list
 sage pending

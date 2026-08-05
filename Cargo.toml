@@ -2,7 +2,7 @@
 name = "sage"
 version = "0.3.0"
 edition = "2021"
-description = "Linux voice-to-text CLI (record → whisper → text)"
+description = "Fast, offline Linux speech-to-text CLI"
 license = "MIT"
 readme = "README.md"
 
@@ -14,8 +14,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 thiserror = "2"
-whisper-rs = "0.14"
+transcribe-cpp = { version = "0.1.3", default-features = false }
 ureq = { version = "2", default-features = false, features = ["tls"] }
+sha2 = "0.10"
 toml = "0.8"
 arboard = "3"
 ctrlc = "3"

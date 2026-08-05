@@ -1,165 +1,112 @@
-//! Speech-to-text via whisper-rs with a daemon-retained Whisper context.
+//! Multi-family speech-to-text through a daemon-retained transcribe.cpp session.
 
-use crate::paths::{ensure_dirs, models_dir};
-use std::os::unix::fs::PermissionsExt;
+use crate::models::{self, ModelError, ModelFile, ModelSpec};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use thiserror::Error;
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
-
-pub const DEFAULT_MODEL_NAME: &str = "ggml-tiny.bin";
-pub const DEFAULT_MODEL_URL: &str =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin";
+use transcribe_cpp::{
+    Backend, Model, ModelOptions, RunOptions, Session, SessionOptions, TimestampKind,
+};
 
 #[derive(Debug, Error)]
 pub enum AsrError {
-    #[error("model not found at {0} — run `sage model pull`")]
-    ModelMissing(PathBuf),
+    #[error("no transcription model selected — run `sage model list`, then `sage model use <id>`")]
+    NoModelSelected,
+    #[error("model '{id}' is not installed at {path} — run `sage model use {id}`")]
+    ModelMissing { id: String, path: PathBuf },
     #[error("failed to load model: {0}")]
     LoadModel(String),
     #[error("failed to read audio: {0}")]
     AudioRead(String),
     #[error("transcription failed: {0}")]
     Transcribe(String),
-    #[error("download failed: {0}")]
-    Download(String),
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Model(#[from] ModelError),
 }
 
-pub fn default_model_path() -> PathBuf {
-    if let Ok(p) = std::env::var("SAGE_MODEL_PATH") {
-        return PathBuf::from(p);
-    }
-    if let Ok(settings) = crate::config::load() {
-        if let Some(m) = settings.model {
-            return PathBuf::from(m);
-        }
-    }
-    models_dir().join(DEFAULT_MODEL_NAME)
+pub struct Selection {
+    pub model: &'static ModelSpec,
+    pub file: &'static ModelFile,
+    pub path: PathBuf,
+    pub language: Option<String>,
 }
 
-pub fn pull_default_model() -> Result<PathBuf, AsrError> {
-    ensure_dirs()?;
-    let dest = default_model_path();
-    if dest.exists() {
-        let meta = std::fs::metadata(&dest)?;
-        if meta.len() > 1_000_000 {
-            return Ok(dest);
-        }
-    }
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    eprintln!("downloading {DEFAULT_MODEL_NAME} …");
-    eprintln!("  from: {DEFAULT_MODEL_URL}");
-    eprintln!("  to:   {}", dest.display());
-
-    let tmp = dest.with_extension("bin.partial");
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(15))
-        .timeout_read(Duration::from_secs(120))
-        .build();
-    let response = agent
-        .get(DEFAULT_MODEL_URL)
-        .call()
-        .map_err(|e| AsrError::Download(e.to_string()))?;
-
-    if !(200..300).contains(&response.status()) {
-        return Err(AsrError::Download(format!(
-            "HTTP {} fetching model",
-            response.status()
-        )));
-    }
-
-    let mut reader = response.into_reader();
-    let mut file = std::fs::File::create(&tmp)?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    std::io::copy(&mut reader, &mut file)?;
-    drop(file);
-
-    let size = std::fs::metadata(&tmp)?.len();
-    if size < 1_000_000 {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(AsrError::Download(format!(
-            "downloaded file too small ({size} bytes)"
-        )));
-    }
-
-    std::fs::rename(&tmp, &dest)?;
-    eprintln!("model ready ({} MB)", size / 1_000_000);
-    Ok(dest)
+pub fn selected() -> Result<Selection, AsrError> {
+    let settings = crate::config::load().map_err(|error| AsrError::LoadModel(error.to_string()))?;
+    selection_from_settings(&settings)
 }
 
-#[cfg(test)]
-pub fn transcribe_file_with_model(
-    audio_path: &Path,
-    model_path: &Path,
-    threads: i32,
-) -> Result<String, AsrError> {
-    if !model_path.exists() {
-        return Err(AsrError::ModelMissing(model_path.to_path_buf()));
-    }
-    if !audio_path.exists() {
-        return Err(AsrError::AudioRead(format!(
-            "file not found: {}",
-            audio_path.display()
+fn selection_from_settings(settings: &crate::config::Settings) -> Result<Selection, AsrError> {
+    let id = settings.model.as_deref().ok_or(AsrError::NoModelSelected)?;
+    let model = models::find(id)?;
+    let file = models::file_for(model, settings.model_quant.as_deref())?;
+    let path = models::path_for(file);
+    let language =
+        models::effective_language(model, &settings.language).map_err(AsrError::LoadModel)?;
+    Ok(Selection {
+        model,
+        file,
+        path,
+        language,
+    })
+}
+
+pub fn validate_model(path: &Path, spec: &ModelSpec, threads: u32) -> Result<(), AsrError> {
+    let model = load_model(path)?;
+    let architecture = model.arch();
+    if architecture != spec.architecture {
+        return Err(AsrError::LoadModel(format!(
+            "expected architecture '{}', found '{}'",
+            spec.architecture, architecture
         )));
     }
+    model
+        .session_with(&session_options(threads))
+        .map_err(|error| AsrError::LoadModel(error.to_string()))?;
+    Ok(())
+}
 
-    whisper_rs::install_logging_hooks();
-
-    let context = WhisperContext::new_with_params(
-        model_path.to_string_lossy().as_ref(),
-        WhisperContextParameters::default(),
+fn load_model(path: &Path) -> Result<Model, AsrError> {
+    Model::load_with(
+        path,
+        &ModelOptions {
+            backend: Backend::Cpu,
+            gpu_device: 0,
+        },
     )
-    .map_err(|e| AsrError::LoadModel(e.to_string()))?;
-
-    transcribe_with_context(audio_path, &context, threads)
+    .map_err(|error| AsrError::LoadModel(error.to_string()))
 }
 
-fn transcribe_with_context(
-    audio_path: &Path,
-    context: &WhisperContext,
-    threads: i32,
-) -> Result<String, AsrError> {
-    let mut state = context
-        .create_state()
-        .map_err(|e| AsrError::LoadModel(e.to_string()))?;
-
-    let samples = load_wav_as_whisper_samples(audio_path)?;
-
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    params.set_n_threads(threads.max(1));
-    params.set_print_special(false);
-    params.set_print_progress(false);
-    params.set_print_realtime(false);
-    params.set_print_timestamps(false);
-    params.set_language(Some("auto"));
-
-    state
-        .full(params, &samples)
-        .map_err(|e| AsrError::Transcribe(e.to_string()))?;
-
-    let n = state
-        .full_n_segments()
-        .map_err(|e| AsrError::Transcribe(e.to_string()))?;
-
-    let mut text = String::new();
-    for i in 0..n {
-        let seg = state
-            .full_get_segment_text(i)
-            .map_err(|e| AsrError::Transcribe(e.to_string()))?;
-        text.push_str(&seg);
+fn session_options(threads: u32) -> SessionOptions {
+    SessionOptions {
+        n_threads: i32::try_from(threads).unwrap_or(i32::MAX),
+        ..SessionOptions::default()
     }
-
-    Ok(text.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
-fn load_wav_as_whisper_samples(path: &Path) -> Result<Vec<f32>, AsrError> {
+fn transcribe_with_session(
+    audio_path: &Path,
+    session: &mut Session,
+    language: Option<String>,
+) -> Result<String, AsrError> {
+    let samples = load_wav_samples(audio_path)?;
+    let options = RunOptions {
+        timestamps: TimestampKind::None,
+        language,
+        ..RunOptions::default()
+    };
+    let transcript = session
+        .run(&samples, &options)
+        .map_err(|error| AsrError::Transcribe(error.to_string()))?;
+    Ok(transcript
+        .text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+
+fn load_wav_samples(path: &Path) -> Result<Vec<f32>, AsrError> {
     let mut reader =
-        hound::WavReader::open(path).map_err(|e| AsrError::AudioRead(e.to_string()))?;
+        hound::WavReader::open(path).map_err(|error| AsrError::AudioRead(error.to_string()))?;
     let spec = reader.spec();
     let sample_rate = spec.sample_rate;
     let channels = spec.channels as usize;
@@ -214,66 +161,72 @@ fn load_wav_as_whisper_samples(path: &Path) -> Result<Vec<f32>, AsrError> {
         interleaved
     };
 
-    let samples = if sample_rate == 16_000 {
+    Ok(if sample_rate == 16_000 {
         mono
     } else {
         resample_linear(&mono, sample_rate, 16_000)
-    };
-
-    Ok(samples)
+    })
 }
 
-/// Whisper engine retained by the daemon's serial worker between jobs.
-pub struct PersistentWhisper {
-    model_path: Option<PathBuf>,
-    context: Option<WhisperContext>,
+/// One serial engine is retained by the daemon and reloaded only on selection changes.
+pub struct PersistentStt {
+    selection_key: Option<(String, String, u32)>,
+    session: Option<Session>,
 }
 
-impl PersistentWhisper {
+impl PersistentStt {
     pub fn new() -> Self {
         Self {
-            model_path: None,
-            context: None,
+            selection_key: None,
+            session: None,
         }
     }
 
     pub fn transcribe(&mut self, audio_path: &Path) -> Result<String, AsrError> {
         let settings =
             crate::config::load().map_err(|error| AsrError::LoadModel(error.to_string()))?;
-        let model_path = settings
-            .model
-            .map(PathBuf::from)
-            .unwrap_or_else(default_model_path);
-        if !model_path.exists() {
-            return Err(AsrError::ModelMissing(model_path));
+        let selection = selection_from_settings(&settings)?;
+        if !models::is_downloaded(selection.file) {
+            return Err(AsrError::ModelMissing {
+                id: selection.model.id.into(),
+                path: selection.path,
+            });
         }
-        if self.model_path.as_ref() != Some(&model_path) || self.context.is_none() {
-            whisper_rs::install_logging_hooks();
-            self.context = Some(
-                WhisperContext::new_with_params(
-                    model_path.to_string_lossy().as_ref(),
-                    WhisperContextParameters::default(),
-                )
-                .map_err(|error| AsrError::LoadModel(error.to_string()))?,
+
+        let key = session_key(selection.model, selection.file, settings.stt_threads);
+        if self.selection_key.as_ref() != Some(&key) || self.session.is_none() {
+            models::verify_file(&selection.path, selection.file)?;
+            let model = load_model(&selection.path)?;
+            let architecture = model.arch();
+            if architecture != selection.model.architecture {
+                return Err(AsrError::LoadModel(format!(
+                    "catalog expected architecture '{}', model reports '{}'",
+                    selection.model.architecture, architecture
+                )));
+            }
+            self.session = Some(
+                model
+                    .session_with(&session_options(settings.stt_threads))
+                    .map_err(|error| AsrError::LoadModel(error.to_string()))?,
             );
-            self.model_path = Some(model_path);
+            self.selection_key = Some(key);
         }
-        let threads = if settings.whisper_threads == 0 {
-            num_cpus_soft()
-        } else {
-            i32::try_from(settings.whisper_threads).unwrap_or(i32::MAX)
-        };
-        transcribe_with_context(
+
+        transcribe_with_session(
             audio_path,
-            self.context.as_ref().expect("context loaded"),
-            threads,
+            self.session.as_mut().expect("session loaded"),
+            selection.language,
         )
     }
 
     pub fn unload(&mut self) {
-        self.context = None;
-        self.model_path = None;
+        self.session = None;
+        self.selection_key = None;
     }
+}
+
+fn session_key(model: &ModelSpec, file: &ModelFile, threads: u32) -> (String, String, u32) {
+    (model.id.to_string(), file.quant.to_string(), threads)
 }
 
 fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
@@ -282,21 +235,15 @@ fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     }
     let ratio = to_rate as f64 / from_rate as f64;
     let out_len = ((input.len() as f64) * ratio).round().max(1.0) as usize;
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let src = i as f64 / ratio;
-        let i0 = src.floor() as usize;
-        let i1 = (i0 + 1).min(input.len() - 1);
-        let t = (src - i0 as f64) as f32;
-        out.push(input[i0] * (1.0 - t) + input[i1] * t);
+    let mut output = Vec::with_capacity(out_len);
+    for index in 0..out_len {
+        let source = index as f64 / ratio;
+        let lower = source.floor() as usize;
+        let upper = (lower + 1).min(input.len() - 1);
+        let weight = (source - lower as f64) as f32;
+        output.push(input[lower] * (1.0 - weight) + input[upper] * weight);
     }
-    out
-}
-
-fn num_cpus_soft() -> i32 {
-    std::thread::available_parallelism()
-        .map(|n| n.get().min(8) as i32)
-        .unwrap_or(4)
+    output
 }
 
 #[cfg(test)]
@@ -304,14 +251,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transcribe_missing_model_errors_clearly() {
-        let dir = std::env::temp_dir().join(format!("sage-asr-miss-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let model = dir.join("no-such-model.bin");
-        let wav = dir.join("x.wav");
-        let err = transcribe_file_with_model(&wav, &model, 2).unwrap_err();
-        assert!(matches!(err, AsrError::ModelMissing(_)));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn resampling_preserves_expected_duration() {
+        let samples = vec![0.25; 8_000];
+        assert_eq!(resample_linear(&samples, 8_000, 16_000).len(), 16_000);
+    }
+
+    #[test]
+    fn missing_model_is_reported_before_loading() {
+        let model = models::find("moonshine-streaming-tiny").unwrap();
+        let error = validate_model(Path::new("/no/such/model.gguf"), model, 0).unwrap_err();
+        assert!(matches!(error, AsrError::LoadModel(_)));
+    }
+
+    #[test]
+    fn thread_changes_invalidate_the_retained_session_key() {
+        let model = models::find("moonshine-streaming-tiny").unwrap();
+        let file = models::file_for(model, None).unwrap();
+        assert_ne!(session_key(model, file, 0), session_key(model, file, 4));
     }
 }

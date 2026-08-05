@@ -12,7 +12,7 @@ STAGE="dist/sage-${VERSION}-linux-x86_64"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 cp target/release/sage "$STAGE/"
-cp README.md PHASES.md scripts/install.sh "$STAGE/" 2>/dev/null || true
+cp README.md MODEL_LICENSES.md PHASES.md scripts/install.sh "$STAGE/" 2>/dev/null || true
 chmod +x "$STAGE/install.sh" "$STAGE/sage"
 
 mkdir -p dist
