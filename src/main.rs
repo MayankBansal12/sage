@@ -7,6 +7,7 @@ mod feedback;
 mod global_hotkey;
 mod hotkey;
 mod ipc;
+mod models;
 mod output;
 mod paths;
 mod session;
@@ -98,8 +99,26 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum ModelCmd {
-    Pull,
-    Path,
+    /// List curated speech-to-text models
+    List,
+    /// Show details for a catalog model
+    Info { id: String },
+    /// Download a model without selecting it
+    Pull {
+        id: String,
+        #[arg(long)]
+        quant: Option<String>,
+    },
+    /// Download if needed and select a model
+    Use {
+        id: String,
+        #[arg(long)]
+        quant: Option<String>,
+        #[arg(long)]
+        language: Option<String>,
+    },
+    /// Show the active model
+    Current,
 }
 
 #[derive(Subcommand, Debug)]
@@ -137,8 +156,15 @@ fn main() -> ExitCode {
         Commands::Copy => session::cmd_copy_last(),
         Commands::Transcribe { path } => session::cmd_transcribe(&path),
         Commands::Model { action } => match action {
-            ModelCmd::Pull => session::cmd_model_pull(),
-            ModelCmd::Path => session::cmd_model_path(),
+            ModelCmd::List => session::cmd_model_list(),
+            ModelCmd::Info { id } => session::cmd_model_info(&id),
+            ModelCmd::Pull { id, quant } => session::cmd_model_pull(&id, quant.as_deref()),
+            ModelCmd::Use {
+                id,
+                quant,
+                language,
+            } => session::cmd_model_use(&id, quant.as_deref(), language.as_deref()),
+            ModelCmd::Current => session::cmd_model_current(),
         },
         Commands::History { action } => match action {
             HistoryCmd::List { limit } => session::cmd_history_list(limit),
@@ -185,6 +211,9 @@ fn cmd_paths() -> Result<(), session::SessionError> {
     println!("run_dir:        {}", paths::run_dir().display());
     println!("daemon_socket:  {}", paths::daemon_socket_path().display());
     println!("temp_dir:       {}", paths::temp_dir().display());
-    println!("model_file:     {}", asr::default_model_path().display());
+    match asr::selected() {
+        Ok(selection) => println!("model_file:     {}", selection.path.display()),
+        Err(_) => println!("model_file:     (no model selected)"),
+    }
     Ok(())
 }

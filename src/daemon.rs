@@ -629,7 +629,7 @@ fn join_transcripts(jobs: &[Job], separator: &str) -> String {
 
 fn spawn_transcriber(receiver: mpsc::Receiver<TranscriptionTask>, sender: mpsc::Sender<Event>) {
     std::thread::spawn(move || {
-        let mut engine = asr::PersistentWhisper::new();
+        let mut engine = asr::PersistentStt::new();
         loop {
             match receiver.recv_timeout(Duration::from_secs(10 * 60)) {
                 Ok(task) => {

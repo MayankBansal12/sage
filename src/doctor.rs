@@ -3,6 +3,7 @@
 use crate::asr;
 use crate::config;
 use crate::hotkey::HotKey;
+use crate::models;
 use crate::paths;
 
 pub fn run() -> Result<(), crate::session::SessionError> {
@@ -32,17 +33,26 @@ pub fn run() -> Result<(), crate::session::SessionError> {
         Err(e) => println!("[FAIL] hotkey_parse: {e}"),
     }
 
-    let model = asr::default_model_path();
-    if model.exists() {
-        let mb = std::fs::metadata(&model)
-            .map(|m| m.len() / 1_000_000)
-            .unwrap_or(0);
-        println!("[ OK ] model: {} ({} MB)", model.display(), mb);
-    } else {
-        println!(
-            "[FAIL] model: missing at {} — run `sage model pull`",
-            model.display()
-        );
+    match asr::selected() {
+        Ok(selection) => match models::installation_status(selection.file) {
+            models::InstallationStatus::Verified => println!(
+                "[ OK ] model: {} ({}, {:.1} MiB, checksum verified)",
+                selection.model.name,
+                selection.file.quant,
+                selection.file.size_bytes as f64 / (1024.0 * 1024.0)
+            ),
+            models::InstallationStatus::Missing => println!(
+                "[FAIL] model: {} is missing — run `sage model use {}`",
+                selection.model.name, selection.model.id
+            ),
+            models::InstallationStatus::Corrupt => println!(
+                "[FAIL] model: {} failed integrity verification — run `sage model pull {}`",
+                selection.model.name, selection.model.id
+            ),
+        },
+        Err(_) => println!(
+            "[FAIL] model: none selected — run `sage model list`, then `sage model use <id>`"
+        ),
     }
 
     // Mic
@@ -74,7 +84,8 @@ pub fn run() -> Result<(), crate::session::SessionError> {
 
     println!();
     println!("tips:");
-    println!("  sage model pull");
+    println!("  sage model list");
+    println!("  sage model use <id>");
     println!("  sage start / stop / last");
     println!("  sage config show");
     println!("  sage daemon   # long-running control loop");

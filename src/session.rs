@@ -5,6 +5,7 @@ use crate::audio;
 use crate::config::{self, ConfigError};
 use crate::hotkey::HotKey;
 use crate::ipc::{self, DaemonCommand, DaemonResponse};
+use crate::models::{self, ModelError};
 use crate::output;
 use chrono::{Local, TimeZone};
 use std::path::Path;
@@ -20,6 +21,8 @@ pub enum SessionError {
     Audio(#[from] audio::AudioError),
     #[error(transparent)]
     Asr(#[from] AsrError),
+    #[error(transparent)]
+    Model(#[from] ModelError),
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]
@@ -130,22 +133,186 @@ pub fn cmd_transcribe(path: &Path) -> Result<(), SessionError> {
     )?)
 }
 
-pub fn cmd_model_pull() -> Result<(), SessionError> {
-    let path = asr::pull_default_model()?;
+pub fn cmd_model_list() -> Result<(), SessionError> {
+    let settings = config::load()?;
+    println!("    MODEL                          FAMILY       SIZE       LANGUAGES       SPEED  ACCURACY");
+    for model in models::CATALOG {
+        let file = models::file_for(model, None)?;
+        let active = settings.model.as_deref() == Some(model.id)
+            && settings
+                .model_quant
+                .as_deref()
+                .unwrap_or(models::DEFAULT_QUANT)
+                == file.quant;
+        let marker = match (active, models::is_downloaded(file)) {
+            (true, true) => "*+",
+            (true, false) => "*!",
+            (false, true) => " +",
+            (false, false) => "  ",
+        };
+        let languages = if model.languages.len() == 1 {
+            model.languages[0].to_uppercase()
+        } else {
+            format!("{} languages", model.languages.len())
+        };
+        println!(
+            "{marker}  {:<30} {:<12} {:>7.1} MiB  {:<14} {:>3}/100 {:>3}/100{}",
+            model.id,
+            model.family,
+            file.size_bytes as f64 / (1024.0 * 1024.0),
+            languages,
+            model.speed_score,
+            model.accuracy_score,
+            if model.recommended {
+                "  recommended"
+            } else {
+                ""
+            }
+        );
+    }
+    println!();
+    println!("* active  + downloaded  ! missing");
+    println!("Downloads are checksum-verified before activation.");
+    println!("Select a model with: sage model use <id>");
+    Ok(())
+}
+
+pub fn cmd_model_info(id: &str) -> Result<(), SessionError> {
+    let model = models::find(id)?;
+    let settings = config::load()?;
+    println!("{}", model.name);
+    println!("id:           {}", model.id);
+    println!("description:  {}", model.description);
+    println!("family:       {}", model.family);
+    println!("languages:    {}", model.languages.join(", "));
+    println!(
+        "language ID:  {}",
+        yes_no(model.supports_language_detection)
+    );
+    println!("translation:  {}", yes_no(model.supports_translation));
+    println!(
+        "streaming:    {} (batch mode in Sage)",
+        yes_no(model.supports_streaming)
+    );
+    println!("speed:        {}/100", model.speed_score);
+    println!("accuracy:     {}/100", model.accuracy_score);
+    println!("license:      {}", model.license);
+    println!("base model:   https://huggingface.co/{}", model.base_model);
+    println!("source:       https://huggingface.co/{}", model.repository);
+    println!("quantizations:");
+    for file in model.files {
+        let active = settings.model.as_deref() == Some(model.id)
+            && settings
+                .model_quant
+                .as_deref()
+                .unwrap_or(models::DEFAULT_QUANT)
+                == file.quant;
+        println!(
+            "  {:<8} {:>7.1} MiB  {:<9}{}  {}",
+            file.quant,
+            file.size_bytes as f64 / (1024.0 * 1024.0),
+            if models::is_downloaded(file) {
+                "downloaded"
+            } else {
+                "missing"
+            },
+            if active { " active" } else { "" },
+            models::path_for(file).display()
+        );
+    }
+    Ok(())
+}
+
+pub fn cmd_model_pull(id: &str, quant: Option<&str>) -> Result<(), SessionError> {
+    let model = models::find(id)?;
+    let file = models::file_for(model, quant)?;
+    let path = models::pull(model, file)?;
     println!("model: {}", path.display());
     Ok(())
 }
 
-pub fn cmd_model_path() -> Result<(), SessionError> {
-    let path = asr::default_model_path();
-    println!("{}", path.display());
-    if path.exists() {
-        let len = std::fs::metadata(&path)?.len();
-        println!("status: present ({:.1} MB)", len as f64 / 1_000_000.0);
-    } else {
-        println!("status: missing — run `sage model pull`");
+pub fn cmd_model_use(
+    id: &str,
+    quant: Option<&str>,
+    language: Option<&str>,
+) -> Result<(), SessionError> {
+    let model = models::find(id)?;
+    let file = models::file_for(model, quant)?;
+    let mut settings = config::load()?;
+    let language_intent = language
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| settings.language.clone());
+    let effective =
+        models::effective_language(model, &language_intent).map_err(SessionError::Message)?;
+    let already_selected = settings.model.as_deref() == Some(model.id)
+        && settings
+            .model_quant
+            .as_deref()
+            .unwrap_or(models::DEFAULT_QUANT)
+            == file.quant
+        && models::is_verified(file);
+    if already_selected {
+        if settings.language != language_intent {
+            settings.language = language_intent.clone();
+            config::save(&settings)?;
+        }
+        println!("already selected {} ({})", model.name, file.quant);
+        println!(
+            "language: {}",
+            effective.as_deref().unwrap_or("automatic detection")
+        );
+        return Ok(());
+    }
+    let path = models::pull(model, file)?;
+    asr::validate_model(&path, model, settings.stt_threads)?;
+
+    settings.model = Some(model.id.to_string());
+    settings.model_quant = Some(file.quant.to_string());
+    settings.language = language_intent.clone();
+    config::save(&settings)?;
+
+    println!("selected {} ({})", model.name, file.quant);
+    println!("model: {}", path.display());
+    println!(
+        "language: {}",
+        effective.as_deref().unwrap_or("automatic detection")
+    );
+    if language_intent == "auto" && effective.is_some() {
+        println!("note: this model cannot detect language; using the value above");
     }
     Ok(())
+}
+
+pub fn cmd_model_current() -> Result<(), SessionError> {
+    let selection = asr::selected()?;
+    println!("{}", selection.model.name);
+    println!("id:        {}", selection.model.id);
+    println!("quant:     {}", selection.file.quant);
+    println!("path:      {}", selection.path.display());
+    println!(
+        "status:    {}",
+        match models::installation_status(selection.file) {
+            models::InstallationStatus::Verified => "verified",
+            models::InstallationStatus::Missing => "missing",
+            models::InstallationStatus::Corrupt => "corrupt",
+        }
+    );
+    println!(
+        "language:  {}",
+        selection
+            .language
+            .as_deref()
+            .unwrap_or("automatic detection")
+    );
+    Ok(())
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 pub fn cmd_history_list(limit: usize) -> Result<(), SessionError> {
@@ -227,11 +394,13 @@ pub fn cmd_config_get(key: &str) -> Result<(), SessionError> {
     let settings = config::load()?;
     let value = match key {
         "model" => settings.model.unwrap_or_default(),
+        "model_quant" => settings.model_quant.unwrap_or_default(),
+        "language" => settings.language,
         "copy_to_clipboard" => settings.copy_to_clipboard.to_string(),
         "auto_paste" => settings.auto_paste.to_string(),
         "hotkey" => settings.hotkey,
         "minimum_key_time" => settings.minimum_key_time.to_string(),
-        "whisper_threads" => settings.whisper_threads.to_string(),
+        "stt_threads" => settings.stt_threads.to_string(),
         "max_history_entries" => settings.max_history_entries.to_string(),
         "sound_effects" => settings.sound_effects.to_string(),
         "pending_delivery_hours" => settings.pending_delivery_hours.to_string(),

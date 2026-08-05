@@ -9,8 +9,12 @@ use thiserror::Error;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Settings {
-    /// Optional absolute path to a whisper ggml model.
+    /// Selected catalog model id. `None` means setup is not complete.
     pub model: Option<String>,
+    /// Selected quantization for the catalog model.
+    pub model_quant: Option<String>,
+    /// Language intent: `auto` or a model-supported language code.
+    pub language: String,
     /// Copy transcript to clipboard after successful delivery. Default: true.
     pub copy_to_clipboard: bool,
     /// Deliver pending transcripts when their captured target regains focus.
@@ -19,8 +23,8 @@ pub struct Settings {
     pub hotkey: String,
     /// Minimum recording duration (seconds) before transcribe; shorter = discard.
     pub minimum_key_time: f64,
-    /// Whisper decode threads (0 = auto).
-    pub whisper_threads: u32,
+    /// Speech-to-text CPU threads (0 = engine default).
+    pub stt_threads: u32,
     /// Max history entries to keep (0 = unlimited).
     pub max_history_entries: usize,
     /// Play lightweight start/stop/cancel cues.
@@ -35,11 +39,13 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             model: None,
+            model_quant: None,
+            language: "auto".into(),
             copy_to_clipboard: true,
             auto_paste: true,
             hotkey: "ctrl+shift+space".into(),
             minimum_key_time: 0.2,
-            whisper_threads: 0,
+            stt_threads: 0,
             max_history_entries: 100,
             sound_effects: true,
             pending_delivery_hours: 2.0,
@@ -92,13 +98,12 @@ pub fn save(settings: &Settings) -> Result<(), ConfigError> {
 pub fn set_key(key: &str, value: &str) -> Result<Settings, ConfigError> {
     let mut s = load()?;
     match key {
-        "model" => {
-            s.model = if value.is_empty() || value == "none" {
-                None
-            } else {
-                Some(value.to_string())
-            };
+        "model" | "model_quant" => {
+            return Err(ConfigError::Parse(
+                "use `sage model use <id>` to change the transcription model".into(),
+            ))
         }
+        "language" => s.language = value.to_ascii_lowercase(),
         "copy_to_clipboard" => s.copy_to_clipboard = parse_bool(value)?,
         "auto_paste" => s.auto_paste = parse_bool(value)?,
         "hotkey" => s.hotkey = value.to_string(),
@@ -107,8 +112,8 @@ pub fn set_key(key: &str, value: &str) -> Result<Settings, ConfigError> {
                 .parse()
                 .map_err(|_| ConfigError::Parse(format!("invalid number: {value}")))?
         }
-        "whisper_threads" => {
-            s.whisper_threads = value
+        "stt_threads" => {
+            s.stt_threads = value
                 .parse()
                 .map_err(|_| ConfigError::Parse(format!("invalid u32: {value}")))?
         }
@@ -132,8 +137,8 @@ pub fn set_key(key: &str, value: &str) -> Result<Settings, ConfigError> {
         "pending_separator" => s.pending_separator = parse_separator(value)?,
         other => {
             return Err(ConfigError::Parse(format!(
-                "unknown key '{other}'. Valid: model, copy_to_clipboard, auto_paste, hotkey, \
-                 minimum_key_time, whisper_threads, max_history_entries, sound_effects, \
+                "unknown key '{other}'. Valid: language, copy_to_clipboard, auto_paste, hotkey, \
+                 minimum_key_time, stt_threads, max_history_entries, sound_effects, \
                  pending_delivery_hours, pending_separator"
             )));
         }
@@ -166,6 +171,33 @@ fn parse_bool(v: &str) -> Result<bool, ConfigError> {
 }
 
 fn validate(settings: &Settings) -> Result<(), ConfigError> {
+    match (&settings.model, &settings.model_quant) {
+        (None, Some(_)) => {
+            return Err(ConfigError::Parse(
+                "model_quant cannot be set without a model".into(),
+            ))
+        }
+        (Some(model_id), quant) => {
+            let model = crate::models::find(model_id)
+                .map_err(|error| ConfigError::Parse(error.to_string()))?;
+            crate::models::file_for(model, quant.as_deref())
+                .map_err(|error| ConfigError::Parse(error.to_string()))?;
+            crate::models::effective_language(model, &settings.language)
+                .map_err(ConfigError::Parse)?;
+        }
+        (None, None) => {}
+    }
+    if settings.language != "auto"
+        && (settings.language.is_empty()
+            || !settings
+                .language
+                .chars()
+                .all(|character| character.is_ascii_alphabetic() || character == '-'))
+    {
+        return Err(ConfigError::Parse(
+            "language must be `auto` or a language code such as en or pt".into(),
+        ));
+    }
     if !settings.pending_delivery_hours.is_finite()
         || settings.pending_delivery_hours <= 0.0
         || settings.pending_delivery_hours > 168.0
@@ -208,6 +240,8 @@ mod tests {
         let s = load().unwrap();
         assert!(s.copy_to_clipboard);
         assert!(s.auto_paste);
+        assert_eq!(s.language, "auto");
+        assert!(s.model.is_none());
         std::env::remove_var("SAGE_CONFIG_DIR");
         std::env::remove_var("SAGE_DATA_DIR");
         let _ = fs::remove_dir_all(&dir);

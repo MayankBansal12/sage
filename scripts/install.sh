@@ -47,6 +47,7 @@ EOF
 fi
 
 echo "next:"
-echo "  sage model pull"
+echo "  sage model list"
+echo "  sage model use parakeet-unified-en-0.6b"
 echo "  sage doctor"
 echo "  sage start / stop"
